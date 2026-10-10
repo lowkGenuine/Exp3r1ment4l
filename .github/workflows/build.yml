@@ -1,0 +1,112 @@
+name: Build and publish VST3 packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Source/**'
+      - 'Build/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }} VST3 packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win
+            runner: windows-latest
+          - platform: mac
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out pinned JUCE 7.0.12
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 4f43011b96eb0636104cb3e433894cda98243626
+          submodules: recursive
+          path: dependencies/JUCE
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Patch JUCE for the macOS 15 SDK
+        if: matrix.platform == 'mac'
+        run: python Build/patch_juce_macos.py dependencies/JUCE
+
+      - name: Configure release build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJUCE_PATH="$PWD/dependencies/JUCE" -DEXP3_BUILD_CHECKS=OFF '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64' -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          else
+            cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DJUCE_PATH="$PWD/dependencies/JUCE" -DEXP3_BUILD_CHECKS=OFF
+          fi
+
+      - name: Build both VST3 plug-ins
+        run: cmake --build build --config Release --target Exp3r1ment4l_VST3 Exp3r1ment4lInstrument_VST3 --parallel 2
+
+      - name: Package release downloads
+        run: python Build/package.py --platform ${{ matrix.platform }} --build-dir build --juce-dir dependencies/JUCE --output-dir dist
+
+      - name: Upload build candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish prerelease
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out pinned JUCE source
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 4f43011b96eb0636104cb3e433894cda98243626
+          submodules: recursive
+          path: dependencies/JUCE
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Download Windows and macOS packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create source distribution
+        run: python Build/package.py --platform source --juce-dir dependencies/JUCE --output-dir dist
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view v0.1.4 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v0.1.4 already exists; preserving its assets."
+          else
+            gh release create v0.1.4 dist/*.zip dist/*.sha256 --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Exp3r1ment4l 0.1.4" --notes-file Build/release-notes.md
+          fi
